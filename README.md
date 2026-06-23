@@ -73,16 +73,10 @@ Fetch status:
 wegoodcharger-cli status
 ```
 
-Fetch machine-readable status:
-
-```bash
-wegoodcharger-cli status --json
-```
-
 Use a one-off charger without changing the saved default:
 
 ```bash
-wegoodcharger-cli status --device ECE334ACEF7C
+wegoodcharger-cli status --device [device_id]
 ```
 
 ## Status Behavior
