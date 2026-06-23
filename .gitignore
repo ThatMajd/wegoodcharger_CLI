@@ -1,0 +1,12 @@
+/.DS_Store
+/.pytest_cache
+/.venv
+/TASK1_CONTROL_PATH_REPORT.md
+/WeGoodCharger_1.2.6.apk
+/WeGoodCharger_1.2.6.apk 2
+/WeGoodCharger_1.2.6.apk.zip
+/__pycache__
+/pyproject.toml
+/test.py
+/tests
+/wegoodcharger_cli.egg-info
