@@ -10,7 +10,13 @@ from .auth import AuthStore
 from .client import ApiError, CloudClient, DEFAULT_BASE_URL, TokenExpired
 from .config import Config, load_config, save_config
 from .debug import DebugLogger
-from .domain import DeviceRef, device_list_from_response, select_device, summarize_status_payload
+from .domain import (
+    DeviceRef,
+    charge_records_from_response,
+    device_list_from_response,
+    select_device,
+    summarize_status_payload,
+)
 from .redaction import redact
 
 
@@ -35,6 +41,17 @@ def main(
     state.debug = DebugLogger(debug)
     state.base_url = base_url.rstrip("/")
     state.timeout = timeout
+
+@app.command()
+def debug_token(
+    debug: bool = typer.Option(False, "--debug", help="Print redacted HTTP diagnostics to stderr.")
+) -> None:
+    if debug:
+        config, token = require_auth()
+        echo_json(config.default_device.to_payload())
+        typer.echo(f'Token: {token}')
+    else:
+        typer.echo('Run it with debug flag!')
 
 
 @app.command()
@@ -180,6 +197,113 @@ def status(
     print_human_status(selected.device_id, result["summary"], result["raw"], result.get("message"))
 
 
+@app.command("charge-records")
+def charge_records(
+    page: int = typer.Option(1, "--page", min=1, help="Page number to fetch."),
+    page_size: int = typer.Option(6, "--page-size", min=1, max=100, help="How many records to fetch."),
+    json_output: bool = typer.Option(False, "--json", help="Print charge records as JSON."),
+    debug: bool = typer.Option(False, "--debug", help="Print redacted HTTP diagnostics to stderr."),
+) -> None:
+    """Fetch charge history from the cloud API."""
+    apply_command_debug(debug)
+    config, token = require_auth()
+    client = CloudClient(config.base_url, state.timeout, state.debug)
+
+    try:
+        response = client.charge_records(token, page_num=page, page_size=page_size)
+    except TokenExpired as exc:
+        handle_expired_token(config, exc)
+    except ApiError as exc:
+        fail("Could not fetch charge records.", exc)
+
+    records = charge_records_from_response(response)
+    if json_output:
+        echo_json({"page": page, "page_size": page_size, "records": records, "raw": response})
+        return
+
+    print_human_charge_records(records, page=page, page_size=page_size)
+
+
+@app.command()
+def start(
+    device: str | None = typer.Option(None, "--device", help="Device index, device id, qrcode, or ccid override."),
+    port: int = typer.Option(1, "--port", min=1, help="Charging port number."),
+    json_output: bool = typer.Option(False, "--json", help="Print raw start response as JSON."),
+    debug: bool = typer.Option(False, "--debug", help="Print redacted HTTP diagnostics to stderr."),
+) -> None:
+    """Request start charging for the selected cloud charger."""
+    apply_command_debug(debug)
+    config, token = require_auth()
+    client = CloudClient(config.base_url, state.timeout, state.debug)
+
+    selected = config.default_device
+    if device is not None:
+        try:
+            response = client.device_list(token)
+            selected = select_device(device_list_from_response(response), device)
+        except TokenExpired as exc:
+            handle_expired_token(config, exc)
+        except (ApiError, ValueError) as exc:
+            fail(f"Could not select device {device!r}.", exc)
+
+    if selected is None:
+        selected = auto_select_single_device(config, token, client, json_output=json_output)
+
+    try:
+        response = client.start_charge(token, selected.to_payload(), port=port)
+    except TokenExpired as exc:
+        handle_expired_token(config, exc)
+    except ApiError as exc:
+        fail("Could not start charging.", exc)
+
+    if json_output:
+        echo_json({"device_id": selected.device_id, "port": port, "response": response})
+        return
+
+    typer.echo(f"Start command sent for device {selected.device_id} on port {port}.")
+    typer.echo(json.dumps(redact(response), ensure_ascii=False, indent=2))
+
+
+@app.command()
+def stop(
+    device: str | None = typer.Option(None, "--device", help="Device index, device id, qrcode, or ccid override."),
+    port: int = typer.Option(1, "--port", min=1, help="Charging port number."),
+    json_output: bool = typer.Option(False, "--json", help="Print raw stop response as JSON."),
+    debug: bool = typer.Option(False, "--debug", help="Print redacted HTTP diagnostics to stderr."),
+) -> None:
+    """Request stop charging for the selected cloud charger."""
+    apply_command_debug(debug)
+    config, token = require_auth()
+    client = CloudClient(config.base_url, state.timeout, state.debug)
+
+    selected = config.default_device
+    if device is not None:
+        try:
+            response = client.device_list(token)
+            selected = select_device(device_list_from_response(response), device)
+        except TokenExpired as exc:
+            handle_expired_token(config, exc)
+        except (ApiError, ValueError) as exc:
+            fail(f"Could not select device {device!r}.", exc)
+
+    if selected is None:
+        selected = auto_select_single_device(config, token, client, json_output=json_output)
+
+    try:
+        response = client.stop_charge(token, selected.to_payload(), port=port)
+    except TokenExpired as exc:
+        handle_expired_token(config, exc)
+    except ApiError as exc:
+        fail("Could not stop charging.", exc)
+
+    if json_output:
+        echo_json({"device_id": selected.device_id, "port": port, "response": response})
+        return
+
+    typer.echo(f"Stop command sent for device {selected.device_id} on port {port}.")
+    typer.echo(json.dumps(redact(response), ensure_ascii=False, indent=2))
+
+
 def auto_select_single_device(config: Config, token: str, client: CloudClient, *, json_output: bool) -> DeviceRef:
     try:
         response = client.device_list(token)
@@ -254,3 +378,69 @@ def print_human_status(device_id: str, summary: dict[str, Any], raw: Any, messag
 
     for key in sorted(summary):
         typer.echo(f"{key}: {summary[key]}")
+
+
+def print_human_charge_records(records: list[dict[str, Any]], *, page: int, page_size: int) -> None:
+    typer.echo(f"Charge records page {page} (page size {page_size})")
+    if not records:
+        typer.echo("No charge records returned.")
+        return
+
+    columns = _charge_record_columns(records)
+    rows: list[list[str]] = []
+    for index, record in enumerate(records, start=1):
+        row = [str(index)]
+        for key in columns[1:]:
+            value = record.get(key, "")
+            if key == "elec_kwh" and value not in ("", None):
+                row.append(f"{value} kWh")
+            else:
+                row.append("" if value is None else str(value))
+        rows.append(row)
+
+    widths = [
+        max(len(column), *(len(row[idx]) for row in rows))
+        for idx, column in enumerate(columns)
+    ]
+
+    typer.echo(_table_line(widths))
+    typer.echo(_table_row(columns, widths))
+    typer.echo(_table_line(widths))
+    for row in rows:
+        typer.echo(_table_row(row, widths))
+    typer.echo(_table_line(widths))
+
+
+def _charge_record_columns(records: list[dict[str, Any]]) -> list[str]:
+    preferred = ["#", "orderNo", "elec_kwh", "elec", "money"]
+    seen = set()
+    columns: list[str] = []
+
+    for key in preferred:
+        if key == "#":
+            columns.append(key)
+            seen.add(key)
+            continue
+        if any(key in record for record in records):
+            columns.append(key)
+            seen.add(key)
+
+    extra_keys = sorted(
+        {
+            key
+            for record in records
+            for key in record
+            if key not in seen
+        }
+    )
+    columns.extend(extra_keys)
+    return columns
+
+
+def _table_line(widths: list[int]) -> str:
+    return "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+
+
+def _table_row(values: list[str], widths: list[int]) -> str:
+    cells = [f" {value.ljust(widths[idx])} " for idx, value in enumerate(values)]
+    return "|" + "|".join(cells) + "|"

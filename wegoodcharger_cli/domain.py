@@ -135,6 +135,30 @@ def body_data(value: Any) -> Any:
     return None
 
 
+def charge_records_from_response(value: Any) -> list[dict[str, Any]]:
+    records = body_data(value)
+    if not isinstance(records, list):
+        return []
+
+    formatted: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        formatted.append(format_charge_record(item))
+    return formatted
+
+
+def format_charge_record(record: dict[str, Any]) -> dict[str, Any]:
+    formatted = dict(record)
+    elec = formatted.get("elec")
+    if elec not in (None, ""):
+        try:
+            formatted["elec_kwh"] = round(float(elec) / 100.0, 3)
+        except (TypeError, ValueError):
+            pass
+    return formatted
+
+
 def summarize_status_payload(payload: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None

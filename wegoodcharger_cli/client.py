@@ -64,6 +64,27 @@ class CloudClient:
     def device_list(self, token: str) -> Any:
         return self.request("POST", "/device/deviceList", payload={}, token=token).body
 
+    def charge_records(self, token: str, page_num: int = 1, page_size: int = 6) -> Any:
+        path = f"/chargeRecord/list?&pageNum={page_num}&pageSize={page_size}"
+        payload = {
+            "pageNum": page_num,
+            "pageSize": page_size,
+            "reasonable": True,
+        }
+        return self.request("POST", path, payload=payload, token=token).body
+
+    def start_charge(self, token: str, device_payload: dict[str, Any], port: int = 1) -> Any:
+        payload = self._status_payload(device_payload)
+        payload["port"] = port
+        payload['deviceId'] = payload["ccid"]
+        return self.request("POST", "/device/startCharge", payload=payload, token=token).body
+
+    def stop_charge(self, token: str, device_payload: dict[str, Any], port: int = 1) -> Any:
+        payload = self._status_payload(device_payload)
+        payload["port"] = port
+        payload["deviceId"] = payload["ccid"]
+        return self.request("POST", "/device/stopCharge", payload=payload, token=token).body
+    
     def poll_status(
         self,
         token: str,
