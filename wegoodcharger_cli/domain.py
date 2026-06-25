@@ -47,6 +47,34 @@ class DeviceRef:
         )
 
 
+COMMAND_PAYLOAD_REQUIRED_FIELDS = ("ccid", "qrcode")
+
+
+def missing_command_payload_fields(device: DeviceRef) -> list[str]:
+    return [
+        field
+        for field in COMMAND_PAYLOAD_REQUIRED_FIELDS
+        if getattr(device, field) in (None, "")
+    ]
+
+
+def validate_command_capable_device(device: DeviceRef) -> None:
+    missing = missing_command_payload_fields(device)
+    if missing:
+        fields = ", ".join(missing)
+        raise ValueError(f"device {device.device_id!r} is missing required command field(s): {fields}")
+
+
+def command_payload_for_device(device: DeviceRef) -> dict[str, Any]:
+    validate_command_capable_device(device)
+    # The cloud command API identifies the charger by CCID in the deviceId field.
+    return {
+        "deviceId": device.ccid,
+        "ccid": device.ccid,
+        "qrcode": device.qrcode,
+    }
+
+
 def unwrap_data(value: Any) -> Any:
     if isinstance(value, dict) and "data" in value:
         return value["data"]
