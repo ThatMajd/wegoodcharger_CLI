@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import getpass
 import json
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import typer
@@ -30,6 +32,13 @@ class AppState:
 
 
 state = AppState()
+
+
+@dataclass(frozen=True)
+class AuthenticatedContext:
+    config: Config
+    token: str
+    client: CloudClient
 
 
 @app.callback()
@@ -84,15 +93,14 @@ def devices(
 ) -> None:
     """List cloud devices associated with the account."""
     apply_command_debug(debug)
-    config, token = require_auth()
-    client = CloudClient(config.base_url, state.timeout, state.debug)
+    run_authenticated_command(lambda auth: _devices(auth, json_output=json_output))
 
+
+def _devices(auth: AuthenticatedContext, *, json_output: bool) -> None:
     try:
-        response = client.device_list(token)
-    except TokenExpired as exc:
-        handle_expired_token(config, exc)
+        response = auth.client.device_list(auth.token)
     except ApiError as exc:
-        fail("Could not fetch devices.", exc)
+        fail_api_error("Could not fetch devices.", exc)
 
     device_refs = device_list_from_response(response)
     if json_output:
@@ -103,10 +111,10 @@ def devices(
         typer.echo("No devices found.")
         return
 
-    if len(device_refs) == 1 and config.default_device is None:
-        config.default_device = device_refs[0]
-        save_config(config)
-        typer.echo(f"Only one charger found; default device set to {config.default_device.device_id}.")
+    if len(device_refs) == 1 and auth.config.default_device is None:
+        auth.config.default_device = device_refs[0]
+        save_config(auth.config)
+        typer.echo(f"Only one charger found; default device set to {auth.config.default_device.device_id}.")
 
     for index, device in enumerate(device_refs):
         parts = [f"[{index}]", device.device_id]
@@ -124,24 +132,23 @@ def use_device(
 ) -> None:
     """Save the default device used by status."""
     apply_command_debug(debug)
-    config, token = require_auth()
-    client = CloudClient(config.base_url, state.timeout, state.debug)
+    run_authenticated_command(lambda auth: _use_device(auth, selector))
 
+
+def _use_device(auth: AuthenticatedContext, selector: str) -> None:
     try:
-        response = client.device_list(token)
-    except TokenExpired as exc:
-        handle_expired_token(config, exc)
+        response = auth.client.device_list(auth.token)
     except ApiError as exc:
-        fail("Could not fetch devices.", exc)
+        fail_api_error("Could not fetch devices.", exc)
 
     device_refs = device_list_from_response(response)
     try:
-        config.default_device = select_device(device_refs, selector)
+        auth.config.default_device = select_device(device_refs, selector)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
-    save_config(config)
-    typer.echo(f"Default device set to {config.default_device.device_id}.")
+    save_config(auth.config)
+    typer.echo(f"Default device set to {auth.config.default_device.device_id}.")
 
 
 @app.command()
@@ -154,33 +161,47 @@ def status(
 ) -> None:
     """Fetch one read-only charger status snapshot."""
     apply_command_debug(debug)
-    config, token = require_auth()
-    client = CloudClient(config.base_url, state.timeout, state.debug)
+    run_authenticated_command(
+        lambda auth: _status(
+            auth,
+            device=device,
+            json_output=json_output,
+            poll_count=poll_count,
+            poll_interval=poll_interval,
+        )
+    )
 
-    selected = config.default_device
+
+def _status(
+    auth: AuthenticatedContext,
+    *,
+    device: str | None,
+    json_output: bool,
+    poll_count: int,
+    poll_interval: float,
+) -> None:
+    selected = auth.config.default_device
     if device is not None:
         try:
-            response = client.device_list(token)
+            response = auth.client.device_list(auth.token)
             selected = select_device(device_list_from_response(response), device)
-        except TokenExpired as exc:
-            handle_expired_token(config, exc)
-        except (ApiError, ValueError) as exc:
+        except ValueError as exc:
             fail(f"Could not select device {device!r}.", exc)
+        except ApiError as exc:
+            fail_api_error(f"Could not select device {device!r}.", exc)
 
     if selected is None:
-        selected = auto_select_single_device(config, token, client, json_output=json_output)
+        selected = auto_select_single_device(auth.config, auth.token, auth.client, json_output=json_output)
 
     try:
-        result = client.poll_status(
-            token,
+        result = auth.client.poll_status(
+            auth.token,
             selected.to_payload(),
             poll_count=poll_count,
             poll_interval=poll_interval,
         )
-    except TokenExpired as exc:
-        handle_expired_token(config, exc)
     except ApiError as exc:
-        fail("Could not fetch charger status.", exc)
+        fail_api_error("Could not fetch charger status.", exc)
 
     if json_output:
         echo_json(
@@ -206,15 +227,16 @@ def charge_records(
 ) -> None:
     """Fetch charge history from the cloud API."""
     apply_command_debug(debug)
-    config, token = require_auth()
-    client = CloudClient(config.base_url, state.timeout, state.debug)
+    run_authenticated_command(
+        lambda auth: _charge_records(auth, page=page, page_size=page_size, json_output=json_output)
+    )
 
+
+def _charge_records(auth: AuthenticatedContext, *, page: int, page_size: int, json_output: bool) -> None:
     try:
-        response = client.charge_records(token, page_num=page, page_size=page_size)
-    except TokenExpired as exc:
-        handle_expired_token(config, exc)
+        response = auth.client.charge_records(auth.token, page_num=page, page_size=page_size)
     except ApiError as exc:
-        fail("Could not fetch charge records.", exc)
+        fail_api_error("Could not fetch charge records.", exc)
 
     records = charge_records_from_response(response)
     if json_output:
@@ -233,28 +255,27 @@ def start(
 ) -> None:
     """Request start charging for the selected cloud charger."""
     apply_command_debug(debug)
-    config, token = require_auth()
-    client = CloudClient(config.base_url, state.timeout, state.debug)
+    run_authenticated_command(lambda auth: _start(auth, device=device, port=port, json_output=json_output))
 
-    selected = config.default_device
+
+def _start(auth: AuthenticatedContext, *, device: str | None, port: int, json_output: bool) -> None:
+    selected = auth.config.default_device
     if device is not None:
         try:
-            response = client.device_list(token)
+            response = auth.client.device_list(auth.token)
             selected = select_device(device_list_from_response(response), device)
-        except TokenExpired as exc:
-            handle_expired_token(config, exc)
-        except (ApiError, ValueError) as exc:
+        except ValueError as exc:
             fail(f"Could not select device {device!r}.", exc)
+        except ApiError as exc:
+            fail_api_error(f"Could not select device {device!r}.", exc)
 
     if selected is None:
-        selected = auto_select_single_device(config, token, client, json_output=json_output)
+        selected = auto_select_single_device(auth.config, auth.token, auth.client, json_output=json_output)
 
     try:
-        response = client.start_charge(token, selected.to_payload(), port=port)
-    except TokenExpired as exc:
-        handle_expired_token(config, exc)
+        response = auth.client.start_charge(auth.token, selected.to_payload(), port=port)
     except ApiError as exc:
-        fail("Could not start charging.", exc)
+        fail_api_error("Could not start charging.", exc)
 
     if json_output:
         echo_json({"device_id": selected.device_id, "port": port, "response": response})
@@ -273,28 +294,27 @@ def stop(
 ) -> None:
     """Request stop charging for the selected cloud charger."""
     apply_command_debug(debug)
-    config, token = require_auth()
-    client = CloudClient(config.base_url, state.timeout, state.debug)
+    run_authenticated_command(lambda auth: _stop(auth, device=device, port=port, json_output=json_output))
 
-    selected = config.default_device
+
+def _stop(auth: AuthenticatedContext, *, device: str | None, port: int, json_output: bool) -> None:
+    selected = auth.config.default_device
     if device is not None:
         try:
-            response = client.device_list(token)
+            response = auth.client.device_list(auth.token)
             selected = select_device(device_list_from_response(response), device)
-        except TokenExpired as exc:
-            handle_expired_token(config, exc)
-        except (ApiError, ValueError) as exc:
+        except ValueError as exc:
             fail(f"Could not select device {device!r}.", exc)
+        except ApiError as exc:
+            fail_api_error(f"Could not select device {device!r}.", exc)
 
     if selected is None:
-        selected = auto_select_single_device(config, token, client, json_output=json_output)
+        selected = auto_select_single_device(auth.config, auth.token, auth.client, json_output=json_output)
 
     try:
-        response = client.stop_charge(token, selected.to_payload(), port=port)
-    except TokenExpired as exc:
-        handle_expired_token(config, exc)
+        response = auth.client.stop_charge(auth.token, selected.to_payload(), port=port)
     except ApiError as exc:
-        fail("Could not stop charging.", exc)
+        fail_api_error("Could not stop charging.", exc)
 
     if json_output:
         echo_json({"device_id": selected.device_id, "port": port, "response": response})
@@ -307,10 +327,8 @@ def stop(
 def auto_select_single_device(config: Config, token: str, client: CloudClient, *, json_output: bool) -> DeviceRef:
     try:
         response = client.device_list(token)
-    except TokenExpired as exc:
-        handle_expired_token(config, exc)
     except ApiError as exc:
-        fail("Could not fetch devices.", exc)
+        fail_api_error("Could not fetch devices.", exc)
 
     device_refs = device_list_from_response(response)
     if len(device_refs) == 1:
@@ -335,6 +353,23 @@ def require_auth() -> tuple[Config, str]:
         raise typer.BadParameter(f"No stored token for {config.email}. Run `wegoodcharger-cli login --email {config.email}`.")
 
     return config, token
+
+
+def run_authenticated_command(action: Callable[[AuthenticatedContext], None]) -> None:
+    config, token = require_auth()
+    client = CloudClient(config.base_url, state.timeout, state.debug)
+
+    try:
+        client.get_info(token)
+        action(AuthenticatedContext(config=config, token=token, client=client))
+    except TokenExpired as exc:
+        handle_expired_token(config, exc)
+
+
+def fail_api_error(message: str, exc: ApiError) -> None:
+    if isinstance(exc, TokenExpired):
+        raise exc
+    fail(message, exc)
 
 
 def apply_command_debug(debug: bool) -> None:
