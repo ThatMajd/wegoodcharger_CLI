@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from collections.abc import Callable
 from typing import Any
 
 import requests
@@ -100,17 +99,68 @@ class CloudClient:
         visit_time = self._visit_time_from_response(command_response)
         self.debug.log("status visit time received", visit_time=visit_time)
 
-
-
         self.debug.log("polling status detail", poll_count=poll_count, poll_interval=poll_interval)
-        detail_response = self._poll_request(
-            "get port detail",
-            lambda: self._getPortDetail(token, payload, visit_time),
-            poll_count=poll_count,
-            poll_interval=poll_interval,
-        )
-        status_data = body_data(detail_response.body)
-        if status_data in (None, ""):
+        latest_telemetry: Any = None
+        latest_empty_response: ApiResponse | None = None
+        last_error: ApiError | None = None
+
+        for attempt in range(1, poll_count + 1):
+            self.debug.log("poll attempt", operation="get port detail", attempt=attempt)
+            try:
+                detail_response = self._getPortDetail(token, payload, visit_time)
+            except TokenExpired:
+                self.debug.log("poll auth expired", operation="get port detail", attempt=attempt)
+                raise
+            except ApiError as exc:
+                last_error = exc
+                self.debug.log(
+                    "poll response not nominal",
+                    operation="get port detail",
+                    attempt=attempt,
+                    status=exc.status,
+                    body_shape=_body_shape(exc.body),
+                )
+                if attempt < poll_count:
+                    time.sleep(poll_interval)
+                continue
+
+            status_data = body_data(detail_response.body)
+            if status_data in (None, ""):
+                latest_empty_response = detail_response
+                self.debug.log(
+                    "poll response without telemetry",
+                    operation="get port detail",
+                    attempt=attempt,
+                    body_shape=_body_shape(detail_response.body),
+                )
+            else:
+                latest_telemetry = status_data
+                last_error = None
+                self.debug.log(
+                    "poll telemetry received",
+                    operation="get port detail",
+                    attempt=attempt,
+                    body_shape=_body_shape(status_data),
+                )
+
+            if attempt < poll_count:
+                time.sleep(poll_interval)
+
+        if latest_telemetry is None:
+            if latest_empty_response is None:
+                self.debug.log(
+                    "poll exhausted",
+                    operation="get port detail",
+                    attempts=poll_count,
+                    last_status=last_error.status if last_error else None,
+                    last_body_shape=_body_shape(last_error.body) if last_error else None,
+                )
+                raise ApiError(
+                    f"get port detail did not become nominal after {poll_count} attempts",
+                    status=last_error.status if last_error else None,
+                    body=last_error.body if last_error else None,
+                )
+
             message = (
                 "Status command partially succeeded: charger accepted the status request "
                 "but did not return telemetry data. The charger may be disconnected from "
@@ -118,23 +168,23 @@ class CloudClient:
             )
             self.debug.log(
                 "status partially succeeded without telemetry",
-                response_body=detail_response.body,
+                response_body=latest_empty_response.body,
             )
             return {
-                "raw": detail_response.body,
+                "raw": latest_empty_response.body,
                 "summary": {},
                 "visit_time": visit_time,
                 "partial_success": True,
                 "message": message,
             }
 
-        summary = summarize_status_payload(status_data)
+        summary = summarize_status_payload(latest_telemetry)
         self.debug.log(
             "status data decoded",
             summary_keys=sorted(summary.keys()) if summary else [],
         )
         return {
-            "raw": status_data,
+            "raw": latest_telemetry,
             "summary": summary or {},
             "visit_time": visit_time,
             "partial_success": False,
@@ -182,57 +232,6 @@ class CloudClient:
             "/device/getPortDetail",
             payload=detail_payload,
             token=token,
-        )
-
-    def _poll_request(
-        self,
-        operation_name: str,
-        request_fn: Callable[[], ApiResponse],
-        *,
-        poll_count: int,
-        poll_interval: float,
-    ) -> ApiResponse:
-        last_error: ApiError | None = None
-
-        for attempt in range(1, poll_count + 1):
-            self.debug.log("poll attempt", operation=operation_name, attempt=attempt)
-            try:
-                return request_fn()
-            except TokenExpired:
-                self.debug.log("poll auth expired", operation=operation_name, attempt=attempt)
-                raise
-            except ApiError as exc:
-                last_error = exc
-                if exc.status == 200:
-                    self.debug.log(
-                        "poll nominal response failed validation",
-                        operation=operation_name,
-                        attempt=attempt,
-                        body_shape=_body_shape(exc.body),
-                    )
-                    raise
-
-                self.debug.log(
-                    "poll response not nominal",
-                    operation=operation_name,
-                    attempt=attempt,
-                    status=exc.status,
-                    body_shape=_body_shape(exc.body),
-                )
-                if attempt < poll_count:
-                    time.sleep(poll_interval)
-
-        self.debug.log(
-            "poll exhausted",
-            operation=operation_name,
-            attempts=poll_count,
-            last_status=last_error.status if last_error else None,
-            last_body_shape=_body_shape(last_error.body) if last_error else None,
-        )
-        raise ApiError(
-            f"{operation_name} did not become nominal after {poll_count} attempts",
-            status=last_error.status if last_error else None,
-            body=last_error.body if last_error else None,
         )
 
     def request(
