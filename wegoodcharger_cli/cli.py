@@ -15,9 +15,12 @@ from .debug import DebugLogger
 from .domain import (
     DeviceRef,
     charge_records_from_response,
+    command_payload_for_device,
     device_list_from_response,
+    missing_command_payload_fields,
     select_device,
     summarize_status_payload,
+    validate_command_capable_device,
 )
 from .redaction import redact
 
@@ -112,9 +115,14 @@ def _devices(auth: AuthenticatedContext, *, json_output: bool) -> None:
         return
 
     if len(device_refs) == 1 and auth.config.default_device is None:
-        auth.config.default_device = device_refs[0]
-        save_config(auth.config)
-        typer.echo(f"Only one charger found; default device set to {auth.config.default_device.device_id}.")
+        try:
+            validate_command_capable_device(device_refs[0])
+        except ValueError as exc:
+            typer.echo(f"Only one charger found, but it cannot be used for charger commands: {exc}")
+        else:
+            auth.config.default_device = device_refs[0]
+            save_config(auth.config)
+            typer.echo(f"Only one charger found; default device set to {auth.config.default_device.device_id}.")
 
     for index, device in enumerate(device_refs):
         parts = [f"[{index}]", device.device_id]
@@ -143,10 +151,12 @@ def _use_device(auth: AuthenticatedContext, selector: str) -> None:
 
     device_refs = device_list_from_response(response)
     try:
-        auth.config.default_device = select_device(device_refs, selector)
+        selected = select_device(device_refs, selector)
+        validate_command_capable_device(selected)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
+    auth.config.default_device = selected
     save_config(auth.config)
     typer.echo(f"Default device set to {auth.config.default_device.device_id}.")
 
@@ -180,23 +190,13 @@ def _status(
     poll_count: int,
     poll_interval: float,
 ) -> None:
-    selected = auth.config.default_device
-    if device is not None:
-        try:
-            response = auth.client.device_list(auth.token)
-            selected = select_device(device_list_from_response(response), device)
-        except ValueError as exc:
-            fail(f"Could not select device {device!r}.", exc)
-        except ApiError as exc:
-            fail_api_error(f"Could not select device {device!r}.", exc)
-
-    if selected is None:
-        selected = auto_select_single_device(auth.config, auth.token, auth.client, json_output=json_output)
+    selected = resolve_command_device(auth, device, json_output=json_output)
+    payload = command_payload_for_device(selected)
 
     try:
         result = auth.client.poll_status(
             auth.token,
-            selected.to_payload(),
+            payload,
             poll_count=poll_count,
             poll_interval=poll_interval,
         )
@@ -259,21 +259,11 @@ def start(
 
 
 def _start(auth: AuthenticatedContext, *, device: str | None, port: int, json_output: bool) -> None:
-    selected = auth.config.default_device
-    if device is not None:
-        try:
-            response = auth.client.device_list(auth.token)
-            selected = select_device(device_list_from_response(response), device)
-        except ValueError as exc:
-            fail(f"Could not select device {device!r}.", exc)
-        except ApiError as exc:
-            fail_api_error(f"Could not select device {device!r}.", exc)
-
-    if selected is None:
-        selected = auto_select_single_device(auth.config, auth.token, auth.client, json_output=json_output)
+    selected = resolve_command_device(auth, device, json_output=json_output)
+    payload = command_payload_for_device(selected)
 
     try:
-        response = auth.client.start_charge(auth.token, selected.to_payload(), port=port)
+        response = auth.client.start_charge(auth.token, payload, port=port)
     except ApiError as exc:
         fail_api_error("Could not start charging.", exc)
 
@@ -298,21 +288,11 @@ def stop(
 
 
 def _stop(auth: AuthenticatedContext, *, device: str | None, port: int, json_output: bool) -> None:
-    selected = auth.config.default_device
-    if device is not None:
-        try:
-            response = auth.client.device_list(auth.token)
-            selected = select_device(device_list_from_response(response), device)
-        except ValueError as exc:
-            fail(f"Could not select device {device!r}.", exc)
-        except ApiError as exc:
-            fail_api_error(f"Could not select device {device!r}.", exc)
-
-    if selected is None:
-        selected = auto_select_single_device(auth.config, auth.token, auth.client, json_output=json_output)
+    selected = resolve_command_device(auth, device, json_output=json_output)
+    payload = command_payload_for_device(selected)
 
     try:
-        response = auth.client.stop_charge(auth.token, selected.to_payload(), port=port)
+        response = auth.client.stop_charge(auth.token, payload, port=port)
     except ApiError as exc:
         fail_api_error("Could not stop charging.", exc)
 
@@ -324,23 +304,60 @@ def _stop(auth: AuthenticatedContext, *, device: str | None, port: int, json_out
     typer.echo(json.dumps(redact(response), ensure_ascii=False, indent=2))
 
 
-def auto_select_single_device(config: Config, token: str, client: CloudClient, *, json_output: bool) -> DeviceRef:
+def resolve_command_device(auth: AuthenticatedContext, selector: str | None, *, json_output: bool) -> DeviceRef:
+    if selector is not None:
+        try:
+            response = auth.client.device_list(auth.token)
+            selected = select_device(device_list_from_response(response), selector)
+            validate_command_capable_device(selected)
+            return selected
+        except ValueError as exc:
+            fail(f"Could not select device {selector!r}: {exc}", exc)
+        except ApiError as exc:
+            fail_api_error(f"Could not select device {selector!r}.", exc)
+
+    if auth.config.default_device is not None:
+        try:
+            validate_command_capable_device(auth.config.default_device)
+        except ValueError as exc:
+            fail(f"Saved default device cannot be used for charger commands: {exc}", exc)
+        return auth.config.default_device
+
     try:
-        response = client.device_list(token)
+        response = auth.client.device_list(auth.token)
     except ApiError as exc:
         fail_api_error("Could not fetch devices.", exc)
 
     device_refs = device_list_from_response(response)
-    if len(device_refs) == 1:
-        config.default_device = device_refs[0]
-        save_config(config)
-        if not json_output:
-            typer.echo(f"Only one charger found; default device set to {config.default_device.device_id}.")
-        return config.default_device
+    command_capable_devices = [device for device in device_refs if not missing_command_payload_fields(device)]
 
-    if not device_refs:
+    if len(command_capable_devices) == 1:
+        auth.config.default_device = command_capable_devices[0]
+        save_config(auth.config)
+        if not json_output:
+            qualifier = "charger" if len(device_refs) == 1 else "usable charger"
+            typer.echo(f"Only one {qualifier} found; default device set to {auth.config.default_device.device_id}.")
+        return auth.config.default_device
+
+    if not command_capable_devices:
+        if device_refs:
+            report = command_capability_report(device_refs)
+            fail(f"No command-capable chargers found: {report}", ValueError(report))
         raise typer.BadParameter("No chargers found on this account.")
-    raise typer.BadParameter("No default device set. Run `wegoodcharger-cli devices` then `wegoodcharger-cli use-device <index>`.")
+
+    raise typer.BadParameter(
+        "No default device set. Run `wegoodcharger-cli devices` then "
+        "`wegoodcharger-cli use-device <index>` for a charger with ccid and qrcode."
+    )
+
+
+def command_capability_report(devices: list[DeviceRef]) -> str:
+    parts = []
+    for device in devices:
+        missing = missing_command_payload_fields(device)
+        if missing:
+            parts.append(f"{device.device_id} missing {', '.join(missing)}")
+    return "; ".join(parts) or "all devices are missing required command fields"
 
 
 def require_auth() -> tuple[Config, str]:

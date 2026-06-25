@@ -76,13 +76,11 @@ class CloudClient:
     def start_charge(self, token: str, device_payload: dict[str, Any], port: int = 1) -> Any:
         payload = self._status_payload(device_payload)
         payload["port"] = port
-        payload['deviceId'] = payload["ccid"]
         return self.request("POST", "/device/startCharge", payload=payload, token=token).body
 
     def stop_charge(self, token: str, device_payload: dict[str, Any], port: int = 1) -> Any:
         payload = self._status_payload(device_payload)
         payload["port"] = port
-        payload["deviceId"] = payload["ccid"]
         return self.request("POST", "/device/stopCharge", payload=payload, token=token).body
     
     def poll_status(
@@ -176,7 +174,6 @@ class CloudClient:
     def _getPortDetail(self, token: str, payload: dict[str, Any], visit_time: str) -> ApiResponse:
         detail_payload = dict(payload)
         detail_payload["time"] = visit_time
-        detail_payload['deviceId'] = detail_payload["ccid"]
         return self.request(
             "POST",
             "/device/getPortDetail",
